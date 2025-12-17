@@ -1,0 +1,42 @@
+services:
+  yugabytedb:
+    image: yugabytedb/yugabyte:2025.2.0.0-b131
+    command: |
+      bash -c "
+      rm -f /tmp/yb_data/yugabyted.pid &&
+      /home/yugabyte/bin/yugabyted start --daemon=false --base_dir=/tmp/yb_data --listen=0.0.0.0 --tserver_flags="pgsql_proxy_bind_address=0.0.0.0:5433,yb_num_shards_per_tserver=1"
+      "
+    ports:
+      - "5433:5433"
+    healthcheck:
+      test: ["CMD-SHELL", "/home/yugabyte/bin/ysqlsh -h localhost -p 5433 -U yugabyte -d yugabyte -c 'SELECT 1'"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+    volumes:
+      - yb_data_test_volume:/tmp/yb_data
+    networks:
+      - cbo_net
+
+  tester:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    depends_on:
+      yugabytedb:
+        condition: service_healthy
+    volumes:
+      - ./test_out_dir:/app/test_out_dir
+    environment:
+      PROD_HOST: yugabytedb
+      PROD_PORT: 5433
+      PROD_USER: yugabyte
+      PROD_PASSWORD: ""
+    networks:
+      - cbo_net
+
+volumes:
+  yb_data_test_volume:
+
+networks:
+  cbo_net:
