@@ -14,10 +14,23 @@ const (
 	ImportStatisticsSQLFile = "import_statistics.sql"
 )
 
-type StatisticsDump struct {
-	Version     string             `json:"version"`
-	PgClass     []PgClassStats     `json:"pg_class"`
-	PgStatistic []PgStatisticStats `json:"pg_statistic"`
+// RawJSON is used to preserve the original JSON from PostgreSQL without re-formatting
+type RawJSON json.RawMessage
+
+func (r RawJSON) MarshalJSON() ([]byte, error) {
+	return []byte(r), nil
+}
+
+func (r *RawJSON) UnmarshalJSON(data []byte) error {
+	*r = append((*r)[0:0], data...)
+	return nil
+}
+
+// StatisticsDumpRaw uses RawJSON to preserve original formatting
+type StatisticsDumpRaw struct {
+	Version     string    `json:"version"`
+	PgClass     []RawJSON `json:"pg_class"`
+	PgStatistic []RawJSON `json:"pg_statistic"`
 }
 
 type PgClassStats struct {
@@ -53,17 +66,17 @@ type PgStatisticStats struct {
 	Stanumbers3 []float32   `json:"stanumbers3"`
 	Stanumbers4 []float32   `json:"stanumbers4"`
 	Stanumbers5 []float32   `json:"stanumbers5"`
-	Stavalues1  interface{} `json:"stavalues1"`
-	Stavalues2  interface{} `json:"stavalues2"`
-	Stavalues3  interface{} `json:"stavalues3"`
-	Stavalues4  interface{} `json:"stavalues4"`
-	Stavalues5  interface{} `json:"stavalues5"`
-	// PG15+
-	Stacoll1 interface{} `json:"stacoll1,omitempty"`
-	Stacoll2 interface{} `json:"stacoll2,omitempty"`
-	Stacoll3 interface{} `json:"stacoll3,omitempty"`
-	Stacoll4 interface{} `json:"stacoll4,omitempty"`
-	Stacoll5 interface{} `json:"stacoll5,omitempty"`
+	// PG15+ - stacoll comes after stanumbers in Python
+	Stacoll1   interface{} `json:"stacoll1,omitempty"`
+	Stacoll2   interface{} `json:"stacoll2,omitempty"`
+	Stacoll3   interface{} `json:"stacoll3,omitempty"`
+	Stacoll4   interface{} `json:"stacoll4,omitempty"`
+	Stacoll5   interface{} `json:"stacoll5,omitempty"`
+	Stavalues1 interface{} `json:"stavalues1"`
+	Stavalues2 interface{} `json:"stavalues2"`
+	Stavalues3 interface{} `json:"stavalues3"`
+	Stavalues4 interface{} `json:"stavalues4"`
+	Stavalues5 interface{} `json:"stavalues5"`
 }
 
 func (d *Dumper) ExportStatistics(relationNames []string) error {
@@ -75,10 +88,6 @@ func (d *Dumper) ExportStatistics(relationNames []string) error {
 	var pgMajorVersion int
 	fmt.Sscanf(versionStr, "%d", &pgMajorVersion)
 	pgMajorVersion = pgMajorVersion / 10000
-
-	if _, err := d.conn.Exec(context.Background(), "SET extra_float_digits = 3"); err != nil {
-		return fmt.Errorf("failed to set extra_float_digits: %w", err)
-	}
 
 	schemasFilter := " AND n.nspname NOT IN ('pg_catalog', 'pg_toast', 'information_schema')"
 	relationNamesFilter := ""
@@ -92,7 +101,7 @@ func (d *Dumper) ExportStatistics(relationNames []string) error {
 		relationNamesFilter = fmt.Sprintf(" AND (c.oid IN (%s) OR c.oid IN (SELECT indexrelid FROM pg_index WHERE indrelid IN (%s)))", relsStr, relsStr)
 	}
 
-	// 1. Fetch pg_class stats
+	// 1. Fetch pg_class stats - preserve raw JSON
 	queryClass := fmt.Sprintf(`
 		SELECT row_to_json(t) FROM
             (SELECT c.relname, c.relpages, c.reltuples, c.relallvisible, n.nspname
@@ -105,12 +114,15 @@ func (d *Dumper) ExportStatistics(relationNames []string) error {
 	}
 	defer rowsClass.Close()
 
+	var pgClassRaw []RawJSON
 	var pgClassStats []PgClassStats
 	for rowsClass.Next() {
 		var jsonBytes []byte
 		if err := rowsClass.Scan(&jsonBytes); err != nil {
 			return fmt.Errorf("failed to scan pg_class json: %w", err)
 		}
+		pgClassRaw = append(pgClassRaw, RawJSON(jsonBytes))
+
 		var stat PgClassStats
 		if err := json.Unmarshal(jsonBytes, &stat); err != nil {
 			return fmt.Errorf("failed to unmarshal pg_class json: %w", err)
@@ -119,16 +131,17 @@ func (d *Dumper) ExportStatistics(relationNames []string) error {
 	}
 
 	// 2. Fetch pg_statistic stats
+	// Note: Python has stanumbers before stacoll for PG15+
 	var queryStat string
 	if pgMajorVersion < 15 {
 		queryStat = fmt.Sprintf(`
             SELECT row_to_json(t) FROM
                 (SELECT
-                    n.nspname,
-                    c.relname,
-                    a.attname,
-                    (select nspname from pg_namespace where oid = t.typnamespace) as typnspname,
-                    t.typname,
+                    n.nspname nspname,
+                    c.relname relname,
+                    a.attname attname,
+                    (select nspname from pg_namespace where oid = t.typnamespace) typnspname,
+                    t.typname typname,
                     s.stainherit,
                     s.stanullfrac,
                     s.stawidth,
@@ -160,14 +173,15 @@ func (d *Dumper) ExportStatistics(relationNames []string) error {
                         JOIN pg_type t ON a.atttypid = t.oid) t
             `, schemasFilter, relationNamesFilter)
 	} else {
+		// PG15+: stanumbers before stacoll (matching Python)
 		queryStat = fmt.Sprintf(`
             SELECT row_to_json(t) FROM
                 (SELECT
-                    n.nspname,
-                    c.relname,
-                    a.attname,
-                    (select nspname from pg_namespace where oid = t.typnamespace) as typnspname,
-                    t.typname,
+                    n.nspname nspname,
+                    c.relname relname,
+                    a.attname attname,
+                    (select nspname from pg_namespace where oid = t.typnamespace) typnspname,
+                    t.typname typname,
                     s.stainherit,
                     s.stanullfrac,
                     s.stawidth,
@@ -182,16 +196,16 @@ func (d *Dumper) ExportStatistics(relationNames []string) error {
                     s.staop3,
                     s.staop4,
                     s.staop5,
-                    s.stacoll1,
-                    s.stacoll2,
-                    s.stacoll3,
-                    s.stacoll4,
-                    s.stacoll5,
                     s.stanumbers1,
                     s.stanumbers2,
                     s.stanumbers3,
                     s.stanumbers4,
                     s.stanumbers5,
+                    s.stacoll1,
+                    s.stacoll2,
+                    s.stacoll3,
+                    s.stacoll4,
+                    s.stacoll5,
                     s.stavalues1,
                     s.stavalues2,
                     s.stavalues3,
@@ -211,12 +225,15 @@ func (d *Dumper) ExportStatistics(relationNames []string) error {
 	}
 	defer rowsStat.Close()
 
+	var pgStatisticRaw []RawJSON
 	var pgStatisticStats []PgStatisticStats
 	for rowsStat.Next() {
 		var jsonBytes []byte
 		if err := rowsStat.Scan(&jsonBytes); err != nil {
 			return fmt.Errorf("failed to scan pg_statistic json: %w", err)
 		}
+		pgStatisticRaw = append(pgStatisticRaw, RawJSON(jsonBytes))
+
 		var stat PgStatisticStats
 		if err := json.Unmarshal(jsonBytes, &stat); err != nil {
 			return fmt.Errorf("failed to unmarshal pg_statistic json: %w", err)
@@ -224,18 +241,9 @@ func (d *Dumper) ExportStatistics(relationNames []string) error {
 		pgStatisticStats = append(pgStatisticStats, stat)
 	}
 
-	dumpData := StatisticsDump{
-		Version:     "0.0.1",
-		PgClass:     pgClassStats,
-		PgStatistic: pgStatisticStats,
-	}
-
-	// Write JSON
-	jsonOutput, err := json.MarshalIndent(dumpData, "", "    ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal stats to json: %w", err)
-	}
-	if err := os.WriteFile(filepath.Join(d.config.OutputDir, StatisticsJSONFile), jsonOutput, 0644); err != nil {
+	// Write JSON - using custom format to match Python output
+	jsonOutput := formatStatisticsJSON("1.0.0", pgClassRaw, pgStatisticRaw)
+	if err := os.WriteFile(filepath.Join(d.config.OutputDir, StatisticsJSONFile), []byte(jsonOutput), 0644); err != nil {
 		return fmt.Errorf("failed to write statistics.json: %w", err)
 	}
 
@@ -250,6 +258,42 @@ func (d *Dumper) ExportStatistics(relationNames []string) error {
 
 	return nil
 }
+
+// formatStatisticsJSON formats the statistics JSON to match Python output exactly
+// Python uses indent=4 but keeps each row on a single line
+func formatStatisticsJSON(version string, pgClass []RawJSON, pgStatistic []RawJSON) string {
+	var sb strings.Builder
+	sb.WriteString("{\n")
+	sb.WriteString(fmt.Sprintf("    \"version\": \"%s\",\n", version))
+
+	// pg_class array
+	sb.WriteString("    \"pg_class\": [\n")
+	for i, row := range pgClass {
+		sb.WriteString("        ")
+		sb.Write(row)
+		if i < len(pgClass)-1 {
+			sb.WriteString(",")
+		}
+		sb.WriteString("\n")
+	}
+	sb.WriteString("    ],\n")
+
+	// pg_statistic array
+	sb.WriteString("    \"pg_statistic\": [\n")
+	for i, row := range pgStatistic {
+		sb.WriteString("        ")
+		sb.Write(row)
+		if i < len(pgStatistic)-1 {
+			sb.WriteString(",")
+		}
+		sb.WriteString("\n")
+	}
+	sb.WriteString("    ]\n")
+
+	sb.WriteString("}")
+	return sb.String()
+}
+
 func generateImportSQL(ybMode bool, pgVersion int, pgClass []PgClassStats, pgStat []PgStatisticStats) (string, error) {
 	var sb strings.Builder
 
@@ -258,8 +302,9 @@ func generateImportSQL(ybMode bool, pgVersion int, pgClass []PgClassStats, pgSta
 	}
 
 	for _, cls := range pgClass {
+		// Match Python format exactly
 		sb.WriteString(fmt.Sprintf(
-			"UPDATE pg_class SET reltuples = %f, relpages = %d, relallvisible = %d WHERE relnamespace = '%s'::regnamespace AND (relname = '%s' OR relname = '%s_pkey');\n",
+			"UPDATE pg_class SET reltuples = %v, relpages = %d, relallvisible = %d WHERE relnamespace = '%s'::regnamespace AND (relname = '%s' OR relname = '%s_pkey');\n",
 			cls.Reltuples, cls.Relpages, cls.Relallvisible, cls.Nspname, cls.Relname, cls.Relname))
 	}
 
@@ -340,11 +385,11 @@ func getPgStatisticInsertQuery(pgMajorVersion int, stat PgStatisticStats) (strin
 		case "stainherit":
 			valStr = fmt.Sprintf("%t::%s", stat.Stainherit, typ)
 		case "stanullfrac":
-			valStr = fmt.Sprintf("%f::%s", stat.Stanullfrac, typ)
+			valStr = fmt.Sprintf("%v::%s", stat.Stanullfrac, typ)
 		case "stawidth":
 			valStr = fmt.Sprintf("%d::%s", stat.Stawidth, typ)
 		case "stadistinct":
-			valStr = fmt.Sprintf("%f::%s", stat.Stadistinct, typ)
+			valStr = fmt.Sprintf("%v::%s", stat.Stadistinct, typ)
 		case "stakind1":
 			valStr = fmt.Sprintf("%d::%s", stat.Stakind1, typ)
 		case "stakind2":
@@ -415,7 +460,7 @@ func formatFloatArray(nums []float32, typ string) string {
 	}
 	var strs []string
 	for _, n := range nums {
-		strs = append(strs, fmt.Sprintf("%f", n))
+		strs = append(strs, fmt.Sprintf("%v", n))
 	}
 	return fmt.Sprintf("'{%s}'::%s", strings.Join(strs, ","), typ)
 }
